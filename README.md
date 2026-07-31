@@ -36,6 +36,8 @@ python3 bola_hunter.py \
 
 Output: a `verdicts.csv` verdict log plus per-object request/response evidence under `--out` (both gitignored — they contain target data).
 
+> **Credentials:** for real engagements, prefer passing `--victim-pass` / `--attacker-pass` via an environment variable or a wrapper rather than inline — inline arguments are visible in shell history and `ps`.
+
 ## Design notes
 
 - CSRF handling and automatic re-auth live in `AuthSession`, so the scan loop stays clean.

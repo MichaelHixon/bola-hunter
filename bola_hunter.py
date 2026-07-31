@@ -53,7 +53,7 @@ from pathlib import Path
 import requests
 
 CSRF_INPUT_RE = re.compile(
-    r'name=["\'](?:csrf_token|_csrf|authenticity_token|__RequestVerificationToken)["\']'
+    r'name=["\'](csrf_token|_csrf|authenticity_token|__RequestVerificationToken)["\']'
     r'[^>]*value=["\']([^"\']+)["\']',
     re.IGNORECASE,
 )
@@ -70,23 +70,25 @@ class AuthSession:
         self.s = requests.Session()
         self.s.verify = verify_tls
         self.s.headers["User-Agent"] = "bola-hunter/1.0 (authorized test)"
-        self.csrf = None
+        self.csrf_name = None
+        self.csrf_value = None
         self.login()
 
     def _extract_csrf(self, html):
+        """Return (field_name, value) for the login CSRF token, or (None, None)."""
         m = CSRF_INPUT_RE.search(html or "")
-        return m.group(1) if m else None
+        return (m.group(1), m.group(2)) if m else (None, None)
 
     def login(self):
         """Fetch the login page for a CSRF token, then POST credentials."""
         r = self.s.get(self.base + self.login_path, timeout=20)
-        self.csrf = self._extract_csrf(r.text)
+        self.csrf_name, self.csrf_value = self._extract_csrf(r.text)
         payload = {"username": self.username, "password": self.password}
-        if self.csrf:
-            payload["csrf_token"] = self.csrf
+        if self.csrf_value:
+            payload[self.csrf_name] = self.csrf_value   # submit under the field's REAL name
         r = self.s.post(self.base + self.login_path, data=payload,
                         allow_redirects=True, timeout=20)
-        if r.status_code >= 400 or "logout" not in r.text.lower() and self._looks_like_login(r):
+        if r.status_code >= 400 or ("logout" not in r.text.lower() and self._looks_like_login(r)):
             # Not fatal for every app shape — warn, don't crash, so a tester can adapt.
             print(f"[!] Login for {self.username} may have failed "
                   f"(status {r.status_code}); verify selectors for this app.",
@@ -135,11 +137,18 @@ def parse_ids(spec):
         part = part.strip()
         if not part:
             continue
-        if "-" in part:
-            lo, hi = part.split("-", 1)
-            ids.update(range(int(lo), int(hi) + 1))
-        else:
-            ids.add(int(part))
+        try:
+            if "-" in part:
+                lo, hi = (int(x) for x in part.split("-", 1))
+                if lo > hi:
+                    print(f"[!] range '{part}' is reversed (lo > hi) — skipping.", file=sys.stderr)
+                    continue
+                ids.update(range(lo, hi + 1))
+            else:
+                ids.add(int(part))
+        except ValueError:
+            raise SystemExit(
+                f"[!] invalid id spec: '{part}' — expected integers like '48213' or '48200-48260'")
     return sorted(ids)
 
 
@@ -205,7 +214,14 @@ def run(args):
                     "verdict", "note", "response_file"])
         for oid in scan_ids:
             path = args.object_path.format(id=oid)
-            r = attacker.get(path)
+            try:
+                r = attacker.get(path)
+            except requests.exceptions.RequestException as exc:
+                # A dropped connection mid-scan shouldn't abort a paid run — log and continue.
+                w.writerow([oid, "ERR", 0, "error", f"request failed: {exc}", ""])
+                print(f"[x] object {oid}: request failed ({exc}) — continuing.", file=sys.stderr)
+                time.sleep(args.throttle)
+                continue
             verdict, note = judge(r, known.get(oid), markers)
 
             resp_file = out / "responses" / f"{oid}_{args.attacker_user}.txt"
