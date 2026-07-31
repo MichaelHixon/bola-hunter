@@ -13,10 +13,9 @@ verdicts.csv
 reports/
 out/
 
-# Personal / non-public — durable containment (public-ready even while private)
+# Local / personal (not committed)
 ISA.md
 CLAUDE.md
-private-notes/
 .env
 .env.*
 .DS_Store
