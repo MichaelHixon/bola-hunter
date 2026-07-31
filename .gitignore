@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# Tool output / evidence — NEVER commit target or client data
+*-run/
+bola-run/
+responses/
+verdicts.csv
+reports/
+out/
+
+# Personal / non-public — durable containment (public-ready even while private)
+ISA.md
+CLAUDE.md
+private-notes/
+.env
+.env.*
+.DS_Store
