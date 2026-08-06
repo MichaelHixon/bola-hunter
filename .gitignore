@@ -19,3 +19,6 @@ CLAUDE.md
 .env
 .env.*
 .DS_Store
+
+# Local test lab (not committed)
+.lab/
