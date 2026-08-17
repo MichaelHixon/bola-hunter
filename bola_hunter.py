@@ -339,26 +339,124 @@ def similarity(a, b):
     return round(SequenceMatcher(None, a or "", b or "").ratio(), 3)
 
 
+def _is_int_token(tok):
+    """
+    True iff tok is a plain integer literal with NO significant leading zeros.
+    '48213' and '-5' are integers; '007' is NOT — a zero-padded all-digit value
+    is treated as a natural key (kept literal) so it round-trips unchanged and
+    matches the raw str() form enumerate harvests, keeping exclude_owned honest.
+    """
+    return tok.lstrip("-").isdigit() and tok == str(int(tok))
+
+
 def parse_ids(spec):
-    """Accept '1,2,3' and '100-120' (and mixes) -> sorted unique list of ints."""
-    ids = set()
+    """
+    Accept integer IDs and ranges ('1,2,3', '100-120') AND opaque natural keys
+    ('secretbook1', a slug, a username, a UUID) -> ordered unique list of str.
+
+    Sequential integers are the classic IDOR surface — you walk id±1 because the
+    IDs are guessable. But plenty of APIs key objects by a NON-enumerable natural
+    key (a title, slug, username, UUID); that is a real BOLA class an integer-only
+    scanner cannot even express. A token is treated as an integer range only when
+    BOTH sides of its '-' are integers (so a UUID's dashes stay literal); a plain
+    integer stays numeric; anything else is a literal object key. IDs come back as
+    strings — they format into the URL identically, so existing integer runs are
+    byte-for-byte unchanged — with numeric keys ordered numerically ahead of the
+    lexically-sorted literals.
+    """
+    numeric, literal = set(), set()
     for part in (spec or "").split(","):
         part = part.strip()
         if not part:
             continue
-        try:
-            if "-" in part:
-                lo, hi = (int(x) for x in part.split("-", 1))
+        if "-" in part:
+            lo_s, hi_s = (x.strip() for x in part.split("-", 1))
+            if _is_int_token(lo_s) and _is_int_token(hi_s):
+                lo, hi = int(lo_s), int(hi_s)
                 if lo > hi:
                     print(f"[!] range '{part}' is reversed (lo > hi) — skipping.", file=sys.stderr)
                     continue
-                ids.update(range(lo, hi + 1))
-            else:
-                ids.add(int(part))
-        except ValueError:
-            raise SystemExit(
-                f"[!] invalid id spec: '{part}' — expected integers like '48213' or '48200-48260'")
-    return sorted(ids)
+                numeric.update(range(lo, hi + 1))
+                continue
+            # a '-' inside a non-numeric token (UUID, slug) is part of the key,
+            # not a range operator — fall through and keep it literal.
+        if _is_int_token(part):
+            numeric.add(int(part))
+        else:
+            literal.add(part)
+    return [str(n) for n in sorted(numeric)] + sorted(literal)
+
+
+def exclude_owned(scan_ids, owned_ids):
+    """
+    Drop the attacker's OWN objects from the scan set. Reading an object you own
+    is authorized, so it can never be a BOLA — keeping it only re-flags the
+    attacker's own data as SUSPECT noise. This bites in enumerate mode, where the
+    listed collection naturally includes the attacker's objects. Order preserved.
+    """
+    owned = set(owned_ids)
+    return [oid for oid in scan_ids if oid not in owned]
+
+
+def _find_list(data, list_key=None):
+    """
+    Locate the array of objects inside a collection response. An explicit
+    --enumerate-list-key wins; otherwise take the body if it is already a list,
+    else the first list-valued top-level field (handles the common
+    ``{"Books": [...]}`` / ``{"data": [...]}`` envelope). Returns None if no list
+    is found.
+    """
+    if list_key:
+        node = data.get(list_key) if isinstance(data, dict) else None
+        return node if isinstance(node, list) else None
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for value in data.values():
+            if isinstance(value, list):
+                return value
+    return None
+
+
+def enumerate_object_space(session, enum_path, id_key, list_key=None):
+    """
+    Recon step for NON-enumerable keys — the gap a sequential --scan-range can't
+    cover. Integer IDs you guess; natural keys (titles, slugs, usernames, UUIDs)
+    you cannot, so you ask the API for them: GET a collection endpoint with an
+    authenticated low-priv session and harvest each object's key into a concrete
+    scan set. This turns "I don't know the object names" into targets. Recon
+    quality caps yield — you can only test the objects you can name.
+    """
+    r = session.get(enum_path)
+    if r.status_code != 200:
+        raise SystemExit(
+            f"[!] enumerate: GET {enum_path} returned {r.status_code} (expected 200) — "
+            f"check --enumerate-path and that the session can list the collection")
+    try:
+        data = r.json()
+    except ValueError:
+        raise SystemExit(f"[!] enumerate: {enum_path} did not return JSON")
+    items = _find_list(data, list_key)
+    if items is None:
+        where = f" under key '{list_key}'" if list_key else ""
+        raise SystemExit(f"[!] enumerate: no list of objects found at {enum_path}{where}")
+
+    ordered, seen, skipped = [], set(), 0
+    for item in items:
+        if isinstance(item, dict) and item.get(id_key) is not None:
+            key = str(item[id_key])
+            if key not in seen:
+                seen.add(key)
+                ordered.append(key)
+        else:
+            skipped += 1
+    if not ordered:
+        raise SystemExit(
+            f"[!] enumerate: {len(items)} items at {enum_path} but none carried key "
+            f"'{id_key}' — check --enumerate-id-key")
+    note = f" ({skipped} items missing '{id_key}' skipped)" if skipped else ""
+    print(f"[enum] {enum_path}: discovered {len(ordered)} object keys via '{id_key}'{note}")
+    return ordered
 
 
 def learn_victim(victim, object_path, victim_ids):
@@ -458,16 +556,29 @@ def run(args):
     (out / "responses").mkdir(parents=True, exist_ok=True)
     markers = [m.strip() for m in (args.victim_markers or "").split(",") if m.strip()]
     victim_ids = parse_ids(args.victim_ids)
-    scan_ids = parse_ids(args.scan_range) if args.scan_range else victim_ids
 
     # Startup auth is fatal: a session that can't authenticate (or a victim /
     # attacker that can't read its own objects) has no valid verdict to emit.
     try:
         victim = make_session(args, args.victim_user, args.victim_pass)
         known = learn_victim(victim, args.object_path, victim_ids)
+        # Scan set, richest source first: enumerate the live object space (recon
+        # for natural keys) > an explicit --scan-range > fall back to the victim's
+        # own IDs. Enumeration runs on the authenticated victim session.
+        if args.enumerate_path:
+            scan_ids = enumerate_object_space(
+                victim, args.enumerate_path, args.enumerate_id_key, args.enumerate_list_key)
+        else:
+            scan_ids = parse_ids(args.scan_range) if args.scan_range else victim_ids
         attacker = make_session(args, args.attacker_user, args.attacker_pass)
         attacker_ids = parse_ids(args.attacker_ids) if args.attacker_ids else []
         attacker_verified = prove_attacker_liveness(attacker, args.object_path, attacker_ids)
+        if attacker_ids:
+            before = len(scan_ids)
+            scan_ids = exclude_owned(scan_ids, attacker_ids)
+            if before != len(scan_ids):
+                print(f"[*] excluded {before - len(scan_ids)} attacker-owned "
+                      f"object(s) from the scan set (own reads can't be a BOLA)")
     except AuthError as exc:
         print(f"[!] {exc}", file=sys.stderr)
         return 2
@@ -558,7 +669,9 @@ def build_parser():
     p.add_argument("--victim-user", required=True)
     p.add_argument("--victim-pass", required=True)
     p.add_argument("--victim-ids", required=True,
-                   help="IDs the victim legitimately owns, e.g. 48213,48214")
+                   help="Objects the victim legitimately owns — integers/ranges "
+                        "(48213,48214 / 48200-48260) or natural keys (a title, slug, "
+                        "username, UUID: secretbook1,my-report)")
     p.add_argument("--attacker-user", required=True)
     p.add_argument("--attacker-pass", required=True)
     p.add_argument("--attacker-ids",
@@ -566,7 +679,25 @@ def build_parser():
                         "If set, the attacker must read >=1 at HTTP 200 before scanning, or the "
                         "run aborts. Strongly recommended: without it an unauthenticated attacker "
                         "can produce a false all-clear.")
-    p.add_argument("--scan-range", help="IDs to probe as attacker, e.g. 48200-48260")
+    p.add_argument("--scan-range",
+                   help="IDs to probe as attacker: integers/ranges (48200-48260) "
+                        "or natural keys (secretbook1,other-slug). Ignored when "
+                        "--enumerate-path is given.")
+
+    enum = p.add_argument_group(
+        "enumerate (recon for natural keys)",
+        "Discover the object space instead of guessing it. When keys aren't "
+        "sequential integers (titles, slugs, usernames, UUIDs) you can't walk a "
+        "range — so list a collection endpoint and harvest the keys to scan.")
+    enum.add_argument("--enumerate-path",
+                      help="Collection endpoint to list as the victim, e.g. /books/v1. "
+                           "Its harvested keys become the scan set (overrides --scan-range).")
+    enum.add_argument("--enumerate-id-key", default="id",
+                      help="Field on each listed object to use as its key (default 'id'; "
+                           "e.g. 'book_title', 'username', 'uuid')")
+    enum.add_argument("--enumerate-list-key",
+                      help="Top-level response field holding the array of objects "
+                           "(e.g. 'Books', 'data'). Omit to auto-detect the first list.")
     p.add_argument("--victim-markers", help="Comma-separated known victim data (email, phone) for hard confirmation")
     p.add_argument("--throttle", type=float, default=0.4, help="Seconds between requests (stay under lockout/WAF)")
     p.add_argument("--insecure", action="store_true", help="Skip TLS verification (test envs only)")
