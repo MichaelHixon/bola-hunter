@@ -23,3 +23,9 @@ CLAUDE.md
 # Local test lab (not committed)
 .lab/
 lab/
+
+# Claude Code local config — machine-local settings stay out.
+# settings.json is the exception: shared build/test permissions, no paths, no identity.
+# The /* form is required: git cannot re-include a file under an excluded directory.
+.claude/*
+!.claude/settings.json

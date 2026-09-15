@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(./**)",
+      "Glob(./**)",
+      "Grep(./**)",
+      "Bash(python3 -m pytest:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git show:*)"
+    ],
+    "ask": [
+      "Bash(python3 bola_hunter.py:*)",
+      "Bash(pip install:*)",
+      "Bash(git push:*)",
+      "Bash(gh:*)"
+    ]
+  }
+}
